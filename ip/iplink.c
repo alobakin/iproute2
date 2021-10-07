@@ -1779,6 +1779,9 @@ int do_iplink(int argc, char **argv)
 		return 0;
 	}
 
+	if (matches(*argv, "xdpstats") == 0)
+		return iplink_xdp_stats(argc - 1, argv + 1);
+
 	if (matches(*argv, "property") == 0)
 		return iplink_prop(argc-1, argv+1);
 

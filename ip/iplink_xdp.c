@@ -197,3 +197,306 @@ void xdp_dump(FILE *fp, struct rtattr *xdp, bool link, bool details)
 	if (!details || !link)
 		fprintf(fp, " ");
 }
+
+struct xdp_stats_ctx {
+	FILE		*fp;
+	__u32		flt_if;
+	__u32		flt_type;
+	__u32		cur_if;
+	__u32		saved_if;
+	__u32		saved_type;
+	__u32		saved_ch;
+};
+
+static const char * const xdp_stats_types[] = {
+	[IFLA_XDP_XSTATS_TYPE_XDP]		= "xdp",
+	[IFLA_XDP_XSTATS_TYPE_XSK]		= "xsk",
+};
+
+static const char * const xdp_stats_fields[] = {
+	[IFLA_XDP_XSTATS_PACKETS]		= "rx_xdp_packets",
+	[IFLA_XDP_XSTATS_BYTES]			= "rx_xdp_bytes",
+	[IFLA_XDP_XSTATS_ERRORS]		= "rx_xdp_errors",
+	[IFLA_XDP_XSTATS_ABORTED]		= "rx_xdp_aborted",
+	[IFLA_XDP_XSTATS_DROP]			= "rx_xdp_drop",
+	[IFLA_XDP_XSTATS_INVALID]		= "rx_xdp_invalid",
+	[IFLA_XDP_XSTATS_PASS]			= "rx_xdp_pass",
+	[IFLA_XDP_XSTATS_REDIRECT]		= "rx_xdp_redirect",
+	[IFLA_XDP_XSTATS_REDIRECT_ERRORS]	= "rx_xdp_redirect_errors",
+	[IFLA_XDP_XSTATS_TX]			= "rx_xdp_tx",
+	[IFLA_XDP_XSTATS_TX_ERRORS]		= "rx_xdp_tx_errors",
+	[IFLA_XDP_XSTATS_XMIT_PACKETS]		= "tx_xdp_xmit_packets",
+	[IFLA_XDP_XSTATS_XMIT_BYTES]		= "tx_xdp_xmit_bytes",
+	[IFLA_XDP_XSTATS_XMIT_ERRORS]		= "tx_xdp_xmit_errors",
+	[IFLA_XDP_XSTATS_XMIT_FULL]		= "tx_xdp_xmit_full",
+};
+
+static void xdp_stats_cleanup_ctx(const struct xdp_stats_ctx *ctx, bool ifobj)
+{
+	if (ctx->saved_ch)
+		close_json_array(PRINT_JSON, NULL);
+
+	if (ctx->saved_type >= IFLA_XDP_XSTATS_TYPE_START)
+		close_json_object();
+
+	if (ifobj && ctx->saved_if) {
+		close_json_object();
+		fflush(ctx->fp);
+	}
+}
+
+static int xdp_stats_print_one(FILE *fp, const struct rtattr *attr,
+			       const char *typestr, const char *chstr)
+{
+	struct rtattr *tb[__IFLA_XDP_XSTATS_CNT];
+	__u32 i;
+
+	parse_rtattr_nested(tb, IFLA_XDP_XSTATS_MAX, attr);
+
+	for (i = IFLA_XDP_XSTATS_START; i < __IFLA_XDP_XSTATS_CNT; i++) {
+		const char *stat = xdp_stats_fields[i];
+
+		if (!stat) {
+			fprintf(stderr, "Unknown XDP statistics field %u\n",
+				i);
+			return -1;
+		}
+
+		if (!is_json_context()) {
+			fprintf(fp, "%s-", typestr);
+
+			if (chstr)
+				fprintf(fp, "%s-", chstr);
+
+			fprintf(fp, "%s: ", stat);
+		}
+
+		print_u64(PRINT_ANY, stat, "%llu\n", rta_getattr_u64(tb[i]));
+	}
+
+	return 0;
+}
+
+static int xdp_stats_print_xdpxsk(struct xdp_stats_ctx *ctx,
+				  const struct rtattr *attr,
+				  const char *typestr)
+{
+	__u32 ch = ctx->saved_ch;
+	struct rtattr *i;
+	int rem, ret;
+
+	for (i = RTA_DATA(attr), rem = RTA_PAYLOAD(attr); RTA_OK(i, rem);
+	     i = RTA_NEXT(i, rem)) {
+		char chstr[32];
+
+		switch (i->rta_type) {
+		case IFLA_XDP_XSTATS_SCOPE_SHARED:
+			open_json_object("shared");
+			ret = xdp_stats_print_one(ctx->fp, i, typestr, NULL);
+			close_json_object();
+			break;
+		case IFLA_XDP_XSTATS_SCOPE_CHANNEL:
+			if (!ch)
+				open_json_array(PRINT_JSON, "per-channel");
+
+			snprintf(chstr, sizeof(chstr), "%u", ch);
+			open_json_object(chstr);
+
+			snprintf(chstr, sizeof(chstr), "channel%u", ch++);
+			ret = xdp_stats_print_one(ctx->fp, i, typestr, chstr);
+
+			close_json_object();
+			ctx->saved_ch = ch;
+			break;
+		default:
+			fprintf(stderr, "Unknown XDP statistics scope %u\n",
+				i->rta_type);
+			return -1;
+		}
+
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int xdp_stats_print(struct xdp_stats_ctx *ctx,
+			   const struct rtattr *attr)
+{
+	struct rtattr *i;
+	int rem;
+
+	for (i = RTA_DATA(attr), rem = RTA_PAYLOAD(attr); RTA_OK(i, rem);
+	     i = RTA_NEXT(i, rem)) {
+		__u16 type = i->rta_type;
+		int ret;
+
+		if (ctx->flt_type != IFLA_XDP_XSTATS_TYPE_UNSPEC &&
+		    type != ctx->flt_type)
+			continue;
+
+		switch (type) {
+		case IFLA_XDP_XSTATS_TYPE_XDP:
+		case IFLA_XDP_XSTATS_TYPE_XSK:
+			const char *typestr = xdp_stats_types[type];
+			__u32 ifindex = ctx->cur_if;
+			bool resume_if;
+
+			if (!typestr)
+				goto unknown;
+
+			resume_if = ctx->saved_if == ifindex;
+			if (resume_if && ctx->saved_type == type)
+				goto resume_type;
+
+			xdp_stats_cleanup_ctx(ctx, !resume_if);
+			ctx->saved_if = ifindex;
+			ctx->saved_type = type;
+			ctx->saved_ch = 0;
+
+			if (!resume_if) {
+				const char *ifname = ll_index_to_name(ifindex);
+
+				open_json_object(ifname);
+
+				if (!is_json_context()) {
+					color_fprintf(ctx->fp, COLOR_IFNAME,
+						      "%s", ifname);
+					fprintf(ctx->fp, "/%u:\n", ifindex);
+				}
+			}
+
+			open_json_object(typestr);
+resume_type:
+			ret = xdp_stats_print_xdpxsk(ctx, i, typestr);
+			break;
+		default:
+unknown:
+			fprintf(stderr, "Unknown XDP statistics type %u\n",
+				type);
+			return -1;
+		}
+
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int xdp_stats_iter(struct nlmsghdr *n, void *arg)
+{
+	const struct if_stats_msg *ifsm = NLMSG_DATA(n);
+	struct rtattr *tb[__IFLA_STATS_MAX];
+	struct xdp_stats_ctx *ctx = arg;
+	int len = n->nlmsg_len;
+
+	len -= NLMSG_LENGTH(sizeof(*ifsm));
+	if (len < 0) {
+		fprintf(stderr, "BUG: wrong nlmsg len %d\n", len);
+		return -1;
+	}
+
+	if (ctx->flt_if && ifsm->ifindex != ctx->flt_if)
+		return 0;
+
+	parse_rtattr(tb, IFLA_STATS_MAX, IFLA_STATS_RTA(ifsm), len);
+
+	if (!tb[IFLA_STATS_LINK_XDP_XSTATS])
+		return 0;
+
+	ctx->cur_if = ifsm->ifindex;
+	return xdp_stats_print(ctx, tb[IFLA_STATS_LINK_XDP_XSTATS]);
+}
+
+int iplink_xdp_stats(int argc, char **argv)
+{
+	__u32 filt_mask = IFLA_STATS_FILTER_BIT(IFLA_STATS_LINK_XDP_XSTATS);
+	const char *dev = NULL, *type = NULL;
+	struct xdp_stats_ctx ctx = {
+		.flt_type	= IFLA_XDP_XSTATS_TYPE_UNSPEC,
+		.fp		= stdout,
+	};
+	int i, ret = 0;
+
+	while (argc > 0) {
+		if (!matches(*argv, "dev")) {
+			NEXT_ARG();
+
+			if (dev)
+				duparg2("dev", *argv);
+
+			dev = *argv;
+		} else if (!matches(*argv, "type")) {
+			NEXT_ARG();
+
+			if (type)
+				duparg2("type", *argv);
+
+			type = *argv;
+		} else if (!matches(*argv, "help")) {
+			fprintf(stderr,
+				"Usage: ip link xdpstats [ dev DEV ] [ type TYPE ]\n"
+				"   TYPE xdp    filter regular XDP queues\n"
+				"   TYPE xsk    filter XSK queues\n");
+			return -1;
+		} else {
+			fprintf(stderr,
+				"Command \"%s\" is unknown, try \"ip link xdpstats help\"\n",
+				*argv);
+			return -1;
+		}
+
+		argc--;
+		argv++;
+	}
+
+	if (!dev)
+		goto parse_type;
+
+	ctx.flt_if = ll_name_to_index(dev);
+	if (!ctx.flt_if) {
+		fprintf(stderr, "Device \"%s\" does not exist\n", dev);
+		return -1;
+	}
+
+parse_type:
+	if (!type)
+		goto send_req;
+
+	for (i = IFLA_XDP_XSTATS_TYPE_START;
+	     i < __IFLA_XDP_XSTATS_TYPE_CNT;
+	     i++)
+		if (!strcmp(type, xdp_stats_types[i])) {
+			ctx.flt_type = i;
+			break;
+		}
+
+	if (i == __IFLA_XDP_XSTATS_TYPE_CNT) {
+		fprintf(stderr,
+			"Type \"%s\" is invalid, try \"ip link xdpstats help\"\n",
+			type);
+		return -1;
+	}
+
+send_req:
+	if (rtnl_statsdump_req_filter(&rth, AF_UNSPEC, filt_mask) < 0) {
+		perror("Cannont send dump request");
+		return -1;
+	}
+
+	new_json_obj(json);
+	open_json_object(NULL);
+
+	if (rtnl_dump_filter(&rth, xdp_stats_iter, &ctx) < 0) {
+		fprintf(stderr, "Dump terminated\n");
+		ret = -1;
+	}
+
+	xdp_stats_cleanup_ctx(&ctx, true);
+	close_json_object();
+	delete_json_obj();
+
+	return ret;
+}
