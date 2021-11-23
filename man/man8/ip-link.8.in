@@ -193,6 +193,13 @@ ip-link \- network device configuration
 .IR DEVICE " ]"
 
 .ti -8
+.B ip link xdpstats
+.RB "[ " dev
+.IR DEVICE " ]"
+.RB "[ " type
+.IR TYPE " ]"
+
+.ti -8
 .B ip link help
 .RI "[ " TYPE " ]"
 
@@ -2600,6 +2607,18 @@ specifies the type of devices to display extended statistics for.
 .BI dev " DEVICE "
 .I DEVICE
 specifies the device to display address-family statistics for.
+
+.SS  ip link xdpstats - display generic XDP statistics
+
+.TP
+.BI dev " DEVICE "
+.I DEVICE
+specifies the device to display XDP statistics for.
+
+.TP
+.BI type " TYPE "
+.I TYPE
+specifies the type of XDP statistics to display (xdp, xsk, ...).
 
 .SS  ip link help - display help
 

@@ -152,6 +152,7 @@ void lwt_print_encap(FILE *fp, struct rtattr *encap_type, struct rtattr *encap);
 int xdp_parse(int *argc, char ***argv, struct iplink_req *req, const char *ifname,
 	      bool generic, bool drv, bool offload);
 void xdp_dump(FILE *fp, struct rtattr *tb, bool link, bool details);
+int iplink_xdp_stats(int argc, char **argv);
 
 /* iplink_vrf.c */
 __u32 ipvrf_get_table(const char *name);
